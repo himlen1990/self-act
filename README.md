@@ -44,7 +44,7 @@ rosrun self-act self_rec
 
 #5.play rosbag
 
-rosrun rosbag play xxx.bag
+rosrun rosbag play cutting2.bag
 
 #6.abnormal behavior detect
 
