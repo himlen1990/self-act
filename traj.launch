@@ -1,0 +1,5 @@
+<launch>
+  <param name="robot_description" command="cat $(find ros_caffe)/pr2_urdf.xml" />
+  <node pkg="rviz" type="rviz" name="rosbagplay"
+    output="screen" />
+</launch>

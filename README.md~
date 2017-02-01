@@ -1,0 +1,23 @@
+#self-act
+
+How to use:
+#0.install caffe dependencies:
+sudo apt-get install libatlas-base-dev libprotobuf-dev libleveldb-dev libsnappy-dev libopencv-dev libhdf5-serial-dev protobuf-compiler
+#1.build caffe:
+cd self-awarenss/caffe
+make all
+make distribute
+if you want the system run faster, compile caffe with CUDA. 
+#2. build ros package
+cd self-awareness
+catkin bt
+#3.run package
+roscd self-awareness
+#4.run trajectory-prediciton
+roslaunch self-act traj.launch
+
+this will open rviz
+
+add path plugin in rviz
+
+set the topic to 

@@ -1,0 +1,346 @@
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <tf/transform_listener.h>
+#include <tf/message_filter.h>
+#include <message_filters/subscriber.h>
+
+#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/core/core.hpp>
+#include <nav_msgs/Path.h>
+#include <std_msgs/String.h>
+
+#include <vector>
+#include <boost/format.hpp>
+#include <fstream>
+#include <sstream>
+#include <math.h>
+
+#include "Classifier2.h"
+#include "GraphUtils.h"
+#define joint_num 6
+#define traj_sample 12
+using namespace std;
+
+
+
+class tf_image_extractor
+{
+private:
+  tf::TransformListener listener;
+  tf::MessageFilter<sensor_msgs::Image> *tf_filter;
+  tf::StampedTransform transform;
+  vector<tf::StampedTransform> transform_v;
+
+  
+  vector<cv::Mat> imgs_vec_input_;
+  vector<float> joint_vec_input_;
+  vector<float> trajectory_vec_;
+  vector<float> trajectory_vec_predict;
+  vector<float> distance_vec_;
+  vector<vector<float> > trajectory_vec_vec_predict;
+  char traj_file_name_buffer[50];
+  string model_file;
+  string trained_file;
+  string trajectory_file;
+  Classifier* c;
+  cv::Size caffe_input_geometry_; 
+
+
+  message_filters::Subscriber<sensor_msgs::Image> image_sub;
+  ros::NodeHandle nh_;
+  ros::Publisher Path_pub_L;
+  ros::Publisher Path_pub_R;
+  ros::Publisher labelPub;
+  
+  string frame_name[joint_num];
+  int clip_length;
+
+
+  vector<string> label_name;
+  vector<float> gaussian_mask;
+  vector<vector<float> > previous_output;
+  cv::Size text_offset;
+  int proba_dis_offset;
+public:
+
+  tf_image_extractor():
+    listener(), 
+    clip_length(12),
+    frame_name{"/l_forearm_link","/l_gripper_palm_link","/l_gripper_tool_frame","/r_forearm_link","/r_gripper_palm_link","/r_gripper_tool_frame"}
+  {
+    ros::NodeHandle local_nh("~");
+    image_sub.subscribe(nh_, "/kinect_head_c2/rgb/image_rect_color" , 3);
+    tf_filter = new tf::MessageFilter<sensor_msgs::Image>(image_sub, listener, "base_link", 3);
+    tf_filter->registerCallback (boost::bind(&tf_image_extractor::imageCb, this, _1) );
+    transform_v.resize(joint_num);
+
+    Path_pub_L = nh_.advertise<nav_msgs::Path>("trajectory_predict_leftHand",10); 
+    Path_pub_R = nh_.advertise<nav_msgs::Path>("trajectory_predict_RightHand",10);     
+    labelPub = nh_.advertise<std_msgs::String>("self_action_rec",10);
+
+    trajectory_file = "data/trajectory/";
+
+    model_file  = "data/deploy_lstm.prototxt";
+    trained_file = "data/fc128_lstm_RGB_iter_30000.caffemodel";
+    c = new Classifier(model_file, trained_file);
+    caffe_input_geometry_ = c->get_input_geometry();
+
+
+    string label[10]={"cutting","pick up","stirring","brooming","cleaning desk","pull water","lifting up","open drawer","close drawer","push button"};
+    label_name.assign(label, label+10);
+    
+    float gau_mask[3]={0.1387, 0.3623, 0.499};
+    gaussian_mask.assign(gau_mask, gau_mask+3);
+
+    int baseline;
+    for(int i=0; i<label_name.size(); i++)
+      {
+	Size tempSize = getTextSize(label_name[i], FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
+	if (tempSize.width > text_offset.width)
+	  text_offset.width = tempSize.width;
+      }
+
+    proba_dis_offset = getTextSize("0.00000000", FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline).width;
+
+  }
+
+  ~tf_image_extractor()
+  {
+    delete c;
+  }
+  
+  void imageCb(const sensor_msgs::ImageConstPtr& msg)
+  {
+    cv_bridge::CvImagePtr cv_ptr;
+
+    try
+      {
+	for(int i=0 ; i<joint_num; i++){
+	  listener.lookupTransform("/base_link", frame_name[i] ,ros::Time(0) ,transform);
+	  transform_v[i]=transform;
+	}
+	try
+	  {
+	    cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+	  }
+	catch(cv_bridge::Exception)
+	  {
+	    ROS_ERROR("Unable to convert %s image to bgr8", msg->encoding.c_str());
+	  }
+      }
+    catch (tf::TransformException ex)
+      {
+	ros::Duration(0.1).sleep();
+      }
+
+    cv::Mat received_img = cv_ptr->image;
+
+
+    if (!received_img.empty()) 
+      {
+	vector<cv::Mat> splited_channels = image_preprocess(received_img);
+	int num_channels = c->get_num_channels();
+
+	for(int i=0; i<num_channels; i++)
+	  imgs_vec_input_.push_back(splited_channels[i]);
+
+	for (int i=0; i<transform_v.size(); i++)
+	  {
+	    joint_vec_input_.push_back(transform_v[i].getOrigin().x());
+	    joint_vec_input_.push_back(transform_v[i].getOrigin().y());
+	    joint_vec_input_.push_back(transform_v[i].getOrigin().z());
+	    trajectory_vec_.push_back(transform_v[i].getOrigin().x());
+	    trajectory_vec_.push_back(transform_v[i].getOrigin().y());
+	    trajectory_vec_.push_back(transform_v[i].getOrigin().z());
+	  }
+
+	cout<<trajectory_vec_.size()<<endl;
+	if(imgs_vec_input_.size()>=clip_length*num_channels) //slid window
+	  {
+
+	    vector<float> output = c->Predict(imgs_vec_input_,joint_vec_input_, clip_length, true);
+
+	    //------------------------------------------
+	    previous_output.push_back(output);
+	    vector<float> filter_output_v;
+	    if(previous_output.size() >= 3)
+	      {
+		for(int i=0; i<previous_output[0].size(); i++)
+		  {
+		    float filter_output=0;
+		    for(int j=0; j<gaussian_mask.size(); j++)
+		      {
+			filter_output = filter_output + gaussian_mask[j]*previous_output[j][i];
+		      }
+		    filter_output_v.push_back(filter_output);
+		  }
+		previous_output.erase(previous_output.begin());
+	      }
+	    
+	    float highest_score = 0.0;
+	    int highest_score_index = -1;
+	    //----------------------------------------
+	    for(int i=0; i<filter_output_v.size(); i++)
+	      {
+		
+		if(filter_output_v[i] > highest_score)
+		  {
+		    highest_score = filter_output_v[i];
+		    highest_score_index = i;
+		  }
+		cout<<filter_output_v[i]<<endl;
+		
+		plotHistogram(received_img,filter_output_v,label_name);
+	      }
+	    //--------------------------------------add for trajectory predict-----
+	    std_msgs::String labelmsg;
+	    stringstream ss;
+	    if(highest_score_index != -1)
+	      {
+		//ss<<label_name[highest_score_index];
+		labelmsg.data = label_name[highest_score_index];
+		labelPub.publish(labelmsg);
+		cout<<"!!!!!!!!!"<< label_name[highest_score_index] <<endl;
+	      }
+
+	    if (highest_score_index != -1 && trajectory_vec_.size() > 230 && trajectory_vec_.size() < 320)
+	      {
+
+		for(int i=0; i<traj_sample; i++)
+		  {
+		    sprintf(traj_file_name_buffer, "data/%02d/c%02ds%02d_joint.txt",highest_score_index+1,highest_score_index+1,i+1);
+		    string line;
+		    ifstream traj_file(traj_file_name_buffer);
+		    cout<<traj_file_name_buffer<<endl;
+		    if(traj_file.is_open())
+		      {
+			while(getline(traj_file, line))
+			  {
+			    istringstream ss(line);
+			    string value;
+			    while(getline(ss, value, ','))
+			      {
+				float valuef = atof(value.c_str());
+				trajectory_vec_predict.push_back(valuef);
+			      }
+			  }
+			traj_file.close();
+			//--------------Euclidean distance
+			float sum = 0;
+			float dist = -1;
+			for(int i=0; i<trajectory_vec_.size(); i++)
+			  {
+			    float delta = trajectory_vec_predict[i] - trajectory_vec_[i];
+			    sum += pow(delta,2);
+			  }
+			distance_vec_.push_back(sqrt(sum));
+			//--------------end of Euclidean distance
+			trajectory_vec_vec_predict.push_back(trajectory_vec_predict);
+			trajectory_vec_predict.clear();
+
+		      }	//end if(traj_file	    
+		  }//end for(int i = 0
+		vector<float>::iterator it = min_element(distance_vec_.begin(), distance_vec_.end());
+		int traj_index = distance(distance_vec_.begin(), it);
+		cout << "min value at position " << traj_index << " is " << *it << endl;;
+		//cout << "!!!!!!!!!!!!!!!!!!"<<trajectory_vec_vec_predict[traj_index].size()<<endl;
+
+		nav_msgs::Path traj_predict_left;
+		nav_msgs::Path traj_predict_right;
+		geometry_msgs::PoseStamped ps_l;
+		geometry_msgs::PoseStamped ps_r;
+		for(int i = (trajectory_vec_vec_predict[traj_index].size() - trajectory_vec_.size())/(joint_num*3);  i < trajectory_vec_vec_predict[traj_index].size()/(joint_num*3); i++ )
+		  {
+		    ps_l.pose.position.x = trajectory_vec_vec_predict[traj_index][i*joint_num*3+6];
+		    ps_l.pose.position.y = trajectory_vec_vec_predict[traj_index][i*joint_num*3+7];
+		    ps_l.pose.position.z = trajectory_vec_vec_predict[traj_index][i*joint_num*3+8];
+		    ps_r.pose.position.x = trajectory_vec_vec_predict[traj_index][i*joint_num*3+15];
+		    ps_r.pose.position.y = trajectory_vec_vec_predict[traj_index][i*joint_num*3+16];
+		    ps_r.pose.position.z = trajectory_vec_vec_predict[traj_index][i*joint_num*3+17];
+		    traj_predict_left.poses.push_back(ps_l);
+		    traj_predict_left.header.frame_id="/base_link";
+		    traj_predict_right.poses.push_back(ps_r);
+		    traj_predict_right.header.frame_id="/base_link";
+		  }
+		Path_pub_L.publish(traj_predict_left);
+		Path_pub_R.publish(traj_predict_right);
+	      }//end if(highest_score
+	    //--------------------------------------end add for trajectory predict-----
+
+	    imgs_vec_input_.erase(imgs_vec_input_.begin(), imgs_vec_input_.begin()+1*num_channels);
+	    joint_vec_input_.erase(joint_vec_input_.begin(), joint_vec_input_.begin()+18*1); //1 image correspond to 18 joint positions
+	  }
+
+
+	
+	/*	if(imgs_vec_input_.size()==clip_length*num_channels)
+	  {
+
+	  }*/ 
+      }//end if(!image.empty())
+  }//end imagecb
+
+  vector<cv::Mat> image_preprocess(cv::Mat img)
+  {
+	cv::Mat resized_img;
+	if(img.size() != caffe_input_geometry_)
+	  cv::resize(img, resized_img, caffe_input_geometry_);
+	else
+	  resized_img = img;
+
+	int num_channels = c->get_num_channels();
+	
+	cv::Mat float_img;
+	if (num_channels == 3)
+	  resized_img.convertTo(float_img, CV_32FC3);
+	else
+	  resized_img.convertTo(float_img, CV_32FC1);
+	cv::Mat mean_ = c->get_mean_img();
+	cv::Mat normalized_img;
+	cv::subtract(float_img, mean_, normalized_img);
+
+	vector<cv::Mat> splited_channels;
+	cv::split(normalized_img, splited_channels);
+
+	return splited_channels;
+	
+  }
+
+  void plotHistogram(cv::Mat src, const vector<float> value, const vector<string> label_name)
+  {
+    //    if(value.size() == label.size())
+    // {
+    int bins = value.size();
+    int h = cvCeil(src.cols/(bins+4));
+    int offset = src.cols;
+    int his_offset = src.cols+text_offset.width;
+    RNG rng(12345);
+    Mat display(src.rows, src.cols*2+30, src.type(), cv::Scalar(255,255,255));
+    for(int i=0; i<bins; i++)
+      {
+	int length = cvCeil(value[i] * (src.cols - proba_dis_offset - text_offset.width));
+	Scalar color = Scalar(rng.uniform(0,255),rng.uniform(0,255),rng.uniform(0,255));
+	rectangle(display, cv::Point(his_offset, i*h), cv::Point(his_offset+length, (i+1)*h), color, -1);
+	putText(display, label_name[i], cv::Point(offset, ((i+1)*h-0.5*h)),FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0,0,0));
+	putText(display, to_string(value[i]), cv::Point(src.cols*2 - proba_dis_offset, ((i+1)*h-0.5*h)),FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0,0,0));
+      }
+
+    src.copyTo(display(cv::Rect(0,0,src.cols,src.rows)));
+    cv::imshow("result", display);
+    cv::waitKey(10);
+    //	} 
+  }
+  
+};
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "tf_image_extractor");
+  tf_image_extractor ti_ex;
+  ros::spin();  
+  
+  }
+
